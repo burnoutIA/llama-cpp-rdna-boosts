@@ -1,17 +1,17 @@
 {
-  "release": "v16-4f9dfa0e3-r289",
+  "release": "v18-4f9dfa0e3-r289-harn1",
   "base": "4f9dfa0e3",
   "base_tree": "cfb1f99a2793d89250533834737764cebff10be7",
-  "n_blocks": 16,
-  "n_default": 17,
+  "n_blocks": 18,
+  "n_default": 19,
   "n_temporary": 1,
   "n_optional": 2,
-  "tip": "b1f559df78d472b70b1d7ce1c9e2139c9ca7ebd3",
-  "tree": "7181d396977e90270528d8478ee7b04894a3f39e",
+  "tip": "8818d2b25106a09210f0ccffeb6936d7a0a7afc3",
+  "tree": "01460a79b0f4c746b2aa874f70bd8b0e2353aff9",
   "optional_tree": "1c09de9a0a3cb74dbb8c4a6417ceb7eaa9d5eb30",
   "all_patch": {
     "name": "rdna-boosts-all.patch",
-    "sha256": "bf2a38c461e70a7eba2a319eca4f0c4f7aeee6fb959da7f3ebaea85778e32d31"
+    "sha256": "fc1344bb2a0fd0e238b4af2cef1a6f4902a0e4d2b83febf2e143643e75bbb83f"
   },
   "patches": {
     "0000-rdna-boosts-block-00-foundation-band-uniformity-Meta.patch": "57e8975c0c5e83a7e8d38f554f38b5cb3fc335522a569c33afe92b00ed156497",
@@ -30,6 +30,8 @@
     "0013-rdna-boosts-block-13-MTP-draft-vocabulary-subset-spe.patch": "f339ea13f29a7dd70c7d1b6f8e05cdf13023cacaed34962a659a172ba6a698cc",
     "0014-rdna-boosts-block-14-the-streamed-KV-a-fixed-VRAM-re.patch": "2a94ce87bb5da74a2394dbe46c74809518b253869864c34ba28d4cb79c8ebe84",
     "0015-rdna-boosts-block-15-the-UMA-GTT-expert-store-an-APU.patch": "b77a19cd7d761e8b2d17b450ffaf5111fdabe2a4d7fd9343bb13e14818354616",
+    "0090-harn-speculative-verify-2-16-columns-in-WMMA-iu8-on-RDNA4.patch": "4724aabba21aea67df5fba25aa81a12d31e92746d91ce38c12976070aa54cedb",
+    "0091-harn-GDN-conv-q-k-norm-fusion-on-deferred-conv-state-gather.patch": "aebaf2acfda45c606a2691feadc9e37e94e2f3d9d01c884e7f8b491b6fe2241d",
     "0300-rdna-boosts-block-0300-relaxed-tensor-split-mode-TEM.patch": "5db03d3866a33ce58095e83d857b95e44fa0157c3285454d2a7ad6052cc2515e"
   },
   "optional": {
