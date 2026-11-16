@@ -104203,7 +104203,7 @@ index ed59079a4..d8a211375 100644
      void unmap_weight(const llama_tensor_weight & w) const;
  
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 7c75ab55e..4f5fe619c 100644
+index 7c75ab55e..5ed9db093 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -23,6 +23,7 @@
@@ -104214,15 +104214,17 @@ index 7c75ab55e..4f5fe619c 100644
  #include "ggml-cpp.h"
  
  #include <algorithm>
-@@ -33,6 +34,7 @@
+@@ -32,7 +33,9 @@
+ #include <cstring>
  #include <cmath>
  #include <functional>
++#include <thread>
  #include <map>
 +#include <mutex>
  #include <numeric>
  #include <regex>
  #include <sstream>
-@@ -396,7 +398,13 @@ llama_model * llama_model_create(llm_arch arch, const llama_model_params & param
+@@ -396,7 +399,13 @@ llama_model * llama_model_create(llm_arch arch, const llama_model_params & param
      if (model != nullptr) {
          model->arch = arch;
          if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR && !llm_arch_supports_sm_tensor(arch)) {
@@ -104237,7 +104239,7 @@ index 7c75ab55e..4f5fe619c 100644
          }
      }
  
-@@ -415,7 +423,46 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
+@@ -415,7 +424,46 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
  struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
      const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
      const llama_hparams & hparams = ud->model->hparams;
@@ -104285,7 +104287,7 @@ index 7c75ab55e..4f5fe619c 100644
      const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 || ud->model->arch == LLM_ARCH_DEEPSEEK41 ||
          (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
      const bool is_glm5_next = ud->model->arch == LLM_ARCH_GLM5_NEXT;
-@@ -1367,6 +1414,10 @@ struct llama_model::impl {
+@@ -1367,6 +1415,10 @@ struct llama_model::impl {
      // objects representing data potentially being locked in memory
      llama_mlocks mlock_bufs;
      llama_mlocks mlock_mmaps;
@@ -104296,7 +104298,7 @@ index 7c75ab55e..4f5fe619c 100644
  
      // contexts where the model tensors metadata is stored as well as the corresponding buffers:
      std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
-@@ -1386,6 +1437,10 @@ struct llama_model::impl {
+@@ -1386,6 +1438,15 @@ struct llama_model::impl {
      bool has_tensor_overrides;
  
      std::vector<float> tensor_split_owned;
@@ -104304,10 +104306,15 @@ index 7c75ab55e..4f5fe619c 100644
 +    // MTP draft vocabulary subsets by (n_keep, buffer type), alive while a context holds one
 +    std::mutex mtp_draft_mutex;
 +    std::map<std::pair<int32_t, ggml_backend_buffer_type_t>, std::weak_ptr<const llama_mtp_draft_vocab>> mtp_draft_cache;
++
++    // coarse draft head (LLAMA_MTP_DRAFT_COARSE), built once and kept for the model's lifetime
++    std::mutex coarse_mutex;
++    std::shared_ptr<const llama_mtp_draft_vocab> coarse;
++    bool coarse_tried = false;
  };
  
  bool llama_prec_policy::apply(ggml_tensor * res) const {
-@@ -1789,9 +1844,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1789,9 +1850,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
          return {dev, &pimpl->gpu_buft_list.at(dev)};
      };
  
@@ -104332,7 +104339,7 @@ index 7c75ab55e..4f5fe619c 100644
  
      // assign the repeating layers to the devices according to the splits
      pimpl->dev_layer.resize(n_layer_all);
-@@ -1817,6 +1884,34 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1817,6 +1890,34 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
  
          layers.resize(n_layer_all);
  
@@ -104367,7 +104374,7 @@ index 7c75ab55e..4f5fe619c 100644
          // call the per-model loading function
          load_arch_tensors(ml);
  
-@@ -2006,10 +2101,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -2006,10 +2107,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
          }
      }
  
@@ -104388,7 +104395,7 @@ index 7c75ab55e..4f5fe619c 100644
      pimpl->mappings.reserve(ml.mappings.size());
  
      // create the backend buffers
-@@ -2046,10 +2151,54 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -2046,10 +2157,54 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
  
          std::vector<ggml_backend_buffer_ptr> bufs;
  
@@ -104445,7 +104452,7 @@ index 7c75ab55e..4f5fe619c 100644
              GGML_ASSERT(!ml.no_alloc);
              const size_t max_size = ggml_get_max_tensor_size(ctx);
  
-@@ -2070,6 +2219,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -2070,6 +2225,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                      bufs.emplace_back(buf);
                  }
              }
@@ -104462,7 +104469,7 @@ index 7c75ab55e..4f5fe619c 100644
          } else {
              ggml_backend_buffer_t buf;
              if (ml.no_alloc) {
-@@ -2168,6 +2327,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -2168,6 +2333,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
  
      load_tensors_hadamard();
  
@@ -104478,7 +104485,7 @@ index 7c75ab55e..4f5fe619c 100644
      return true;
  }
  
-@@ -2577,6 +2745,73 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
+@@ -2577,6 +2751,73 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
      return ret;
  }
  
@@ -104552,7 +104559,7 @@ index 7c75ab55e..4f5fe619c 100644
  uint64_t llama_model::n_elements() const {
      return pimpl->n_elements;
  }
-@@ -2910,6 +3145,149 @@ llama_rope_params llama_model::get_rope_params_indexer(const llama_cparams & cpa
+@@ -2910,6 +3151,240 @@ llama_rope_params llama_model::get_rope_params_indexer(const llama_cparams & cpa
      return res;
  }
  
@@ -104601,11 +104608,101 @@ index 7c75ab55e..4f5fe619c 100644
 +    return true;
 +}
 +
++// Coarse MTP draft head: the whole LM head requantized (on the CPU, once) to a low-bit type. See llama_mtp_draft_vocab.
++static std::shared_ptr<llama_mtp_draft_vocab> mtp_draft_coarse_build(const ggml_tensor * out, ggml_backend_buffer_type_t buft, int32_t rerank) {
++    ggml_type type = GGML_TYPE_Q2_K;
++    if (const char * t = getenv("LLAMA_MTP_DRAFT_COARSE_TYPE")) {
++        bool found = false;
++        for (int i = 0; i < GGML_TYPE_COUNT; ++i) {
++            const char * name = ggml_type_name((ggml_type) i);
++            if (name && strcmp(name, t) == 0) { type = (ggml_type) i; found = true; break; }
++        }
++        if (!found) {
++            LLAMA_LOG_ERROR("%s: unknown LLAMA_MTP_DRAFT_COARSE_TYPE %s\n", __func__, t);
++            return nullptr;
++        }
++    }
++    const auto * src_traits = ggml_get_type_traits(out->type);
++    if (out->ne[0] % ggml_blck_size(type) != 0 || (out->type != GGML_TYPE_F32 && src_traits->to_float == nullptr)) {
++        LLAMA_LOG_ERROR("%s: cannot requantize %s to %s\n", __func__, ggml_type_name(out->type), ggml_type_name(type));
++        return nullptr;
++    }
++    const int64_t n_embd = out->ne[0];
++    const int64_t n_row  = out->ne[1];
++    const size_t  src_row = out->nb[1];
++    const size_t  dst_row = ggml_row_size(type, n_embd);
++    const int64_t t0 = ggml_time_us();
++
++    std::vector<uint8_t> src((size_t) n_row * src_row);
++    ggml_backend_tensor_get(out, src.data(), 0, src.size());
++    std::vector<uint8_t> dst((size_t) n_row * dst_row);
++
++    const int n_threads = std::max(1u, std::min(32u, std::thread::hardware_concurrency()));
++    std::vector<std::thread> workers;
++    for (int w = 0; w < n_threads; ++w) {
++        workers.emplace_back([&, w]() {
++            std::vector<float> f((size_t) 64 * n_embd);
++            for (int64_t r0 = (int64_t) w * 64; r0 < n_row; r0 += (int64_t) n_threads * 64) {
++                const int64_t nr = std::min<int64_t>(64, n_row - r0);
++                if (out->type == GGML_TYPE_F32) {
++                    memcpy(f.data(), src.data() + r0 * src_row, nr * src_row);
++                } else {
++                    src_traits->to_float(src.data() + r0 * src_row, f.data(), nr * n_embd);
++                }
++                ggml_quantize_chunk(type, f.data(), dst.data() + r0 * dst_row, 0, nr, n_embd, nullptr);
++            }
++        });
++    }
++    for (auto & t : workers) {
++        t.join();
++    }
++
++    auto res = std::make_shared<llama_mtp_draft_vocab>();
++    res->src    = out;
++    res->rerank = rerank;
++    ggml_init_params ip = { 1 * ggml_tensor_overhead(), nullptr, true };
++    res->ctx.reset(ggml_init(ip));
++    res->head = ggml_new_tensor_2d(res->ctx.get(), type, n_embd, n_row);
++    ggml_format_name(res->head, "mtp_draft_coarse_head");
++    res->buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(res->ctx.get(), buft));
++    if (!res->buf) {
++        LLAMA_LOG_ERROR("%s: buffer allocation failed\n", __func__);
++        return nullptr;
++    }
++    ggml_backend_buffer_set_usage(res->buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++    ggml_backend_tensor_set(res->head, dst.data(), 0, dst.size());
++    LLAMA_LOG_INFO("%s: MTP draft head: coarse %s copy of the %s LM head (%.2f MiB), rerank top %d exactly (%.1f s)\n", __func__,
++                   ggml_type_name(type), ggml_type_name(out->type), (double) dst.size() / 1048576.0, rerank,
++                   (ggml_time_us() - t0) / 1e6);
++    return res;
++}
++
++std::shared_ptr<const llama_mtp_draft_vocab> llama_model::draft_coarse_head() const {
++    const char * e = getenv("LLAMA_MTP_DRAFT_COARSE");
++    if (e == nullptr || atoi(e) <= 0 || output == nullptr || output->buffer == nullptr || output->data == nullptr ||
++            output_s != nullptr) {
++        return nullptr;
++    }
++    std::lock_guard<std::mutex> lock(pimpl->coarse_mutex);
++    if (!pimpl->coarse_tried) {
++        pimpl->coarse_tried = true;
++        auto res = mtp_draft_coarse_build(output, ggml_backend_buffer_get_type(output->buffer), atoi(e));
++        if (res) {
++            res->n_keep = 1;
++        }
++        pimpl->coarse = res;
++    }
++    return pimpl->coarse;
++}
++
 +std::shared_ptr<const llama_mtp_draft_vocab> llama_model::mtp_draft_vocab_get(int32_t n_keep, bool shared_target_head) const {
 +    const ggml_tensor * out = output;
 +    // probe contexts (common_fit_params) use a model with unallocated weights: no subset
 +    if (n_keep <= 0 || out == nullptr || out->buffer == nullptr || out->data == nullptr) {
 +        return nullptr;
++    }
++    if (auto coarse = draft_coarse_head()) {
++        return coarse;
 +    }
 +    // only the MTP graphs that were taught the subset use it, and only when they score with the model LM head:
 +    // qwen35/qwen35moe/qwen4exp (their nextn block or the borrowed target head), and gemma4-assistant, whose
@@ -104643,6 +104740,7 @@ index 7c75ab55e..4f5fe619c 100644
 +    if (auto it = cache.find(key); it != cache.end()) {
 +        return it->second.lock();
 +    }
++
 +
 +    std::string why;
 +    if (!mtp_draft_vocab_ids_follow_merge_order(vocab, why)) {
@@ -104702,7 +104800,7 @@ index 7c75ab55e..4f5fe619c 100644
  float llama_model::get_rope_freq_base (const llama_cparams & cparams, int il) const {
      return hparams.is_swa(il) ? hparams.rope_freq_base_train_swa : cparams.rope_freq_base;
  }
-@@ -2933,6 +3311,85 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
+@@ -2933,6 +3408,85 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
      return layers[il].rope_short;
  }
  
@@ -104788,7 +104886,7 @@ index 7c75ab55e..4f5fe619c 100644
  llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
      llama_memory_i * res;
  
-@@ -3105,6 +3562,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -3105,6 +3659,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                      /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                      /* n_seq_max         */ cparams.n_seq_max,
                      /* n_rs_seq          */ cparams.n_rs_seq,
@@ -104796,7 +104894,7 @@ index 7c75ab55e..4f5fe619c 100644
                      /* offload           */ cparams.offload_kqv,
                      /* unified           */ cparams.kv_unified,
                      /* filter_attn       */ std::move(filter_attn),
-@@ -3279,10 +3737,51 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -3279,10 +3834,51 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
          default:
              {
                  // Dense MTP heads use a plain attention KV cache instead of the hybrid wrapper.
@@ -104849,7 +104947,7 @@ index 7c75ab55e..4f5fe619c 100644
  
                  const bool mtp_on_hybrid_nemotron =
                      params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && arch == LLM_ARCH_NEMOTRON_H_MOE;
-@@ -3297,6 +3796,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -3297,6 +3893,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                              std::max((uint32_t) 1, cparams.n_seq_max),
                              cparams.n_seq_max,
                              cparams.n_rs_seq,
@@ -104857,7 +104955,7 @@ index 7c75ab55e..4f5fe619c 100644
                              nullptr);
                  } else if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid_qwen && !mtp_on_hybrid_nemotron) {
                      // The main difference between hybrid architectures is the
-@@ -3370,6 +3870,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -3370,6 +3967,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                              /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                              /* n_seq_max         */ cparams.n_seq_max,
                              /* n_rs_seq          */ cparams.n_rs_seq,
@@ -104865,7 +104963,7 @@ index 7c75ab55e..4f5fe619c 100644
                              /* offload           */ cparams.offload_kqv,
                              /* unified           */ cparams.kv_unified,
                              /* filter_attn       */ std::move(filter_attn),
-@@ -3390,11 +3891,14 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -3390,11 +3988,14 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                              /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                              /* n_seq_max         */ cparams.n_seq_max,
                              /* n_rs_seq          */ cparams.n_rs_seq,
@@ -104881,7 +104979,7 @@ index 7c75ab55e..4f5fe619c 100644
                      } else {
                          res = new llama_memory_hybrid(
                              /* model             */ *this,
-@@ -3410,10 +3914,13 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -3410,10 +4011,13 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                              /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                              /* n_seq_max         */ cparams.n_seq_max,
                              /* n_rs_seq          */ cparams.n_rs_seq,
@@ -104896,7 +104994,7 @@ index 7c75ab55e..4f5fe619c 100644
                      }
                  } else {
                      llama_kv_cache::layer_filter_cb filter = nullptr;
-@@ -3493,6 +4000,69 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -3493,6 +4097,69 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                      } else {
                          GGML_ASSERT(!hparams.is_swa_any());
  
@@ -104966,7 +105064,7 @@ index 7c75ab55e..4f5fe619c 100644
                          res = new llama_kv_cache(
                                  *this,
                                  params.no_alloc,
-@@ -3502,14 +4072,20 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+@@ -3502,14 +4169,20 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
                                  !cparams.flash_attn,
                                  cparams.offload_kqv,
                                  cparams.kv_unified,
@@ -104991,7 +105089,7 @@ index 7c75ab55e..4f5fe619c 100644
                      }
                  }
              }
-@@ -3558,7 +4134,10 @@ llama_model_params llama_model_default_params() {
+@@ -3558,7 +4231,10 @@ llama_model_params llama_model_default_params() {
          /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
          /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
          /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
@@ -105002,7 +105100,7 @@ index 7c75ab55e..4f5fe619c 100644
          /*.tensor_split                =*/ nullptr,
          /*.progress_callback           =*/ nullptr,
          /*.progress_callback_user_data =*/ nullptr,
-@@ -3569,6 +4148,7 @@ llama_model_params llama_model_default_params() {
+@@ -3569,6 +4245,7 @@ llama_model_params llama_model_default_params() {
          /*.no_host                     =*/ false,
          /*.no_alloc                    =*/ false,
          /*.load_mtp                    =*/ false,
@@ -105010,7 +105108,7 @@ index 7c75ab55e..4f5fe619c 100644
      };
  
      return result;
-@@ -3579,6 +4159,12 @@ const llama_vocab * llama_model_get_vocab(const llama_model * model) {
+@@ -3579,6 +4256,12 @@ const llama_vocab * llama_model_get_vocab(const llama_model * model) {
  }
  
  void llama_model_free(llama_model * model) {
@@ -105023,7 +105121,7 @@ index 7c75ab55e..4f5fe619c 100644
      delete model;
  }
  
-@@ -3627,6 +4213,17 @@ int32_t llama_model_n_swa(const llama_model * model) {
+@@ -3627,6 +4310,17 @@ int32_t llama_model_n_swa(const llama_model * model) {
      return model->hparams.n_swa;
  }
  
@@ -105041,7 +105139,7 @@ index 7c75ab55e..4f5fe619c 100644
  
  uint32_t llama_model_n_cls_out(const struct llama_model * model) {
      return model->hparams.n_cls_out;
-@@ -3991,10 +4588,123 @@ const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_te
+@@ -3991,10 +4685,123 @@ const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_te
      return model->tensors_by_name;
  }
  
@@ -105165,7 +105263,7 @@ index 7c75ab55e..4f5fe619c 100644
  int32_t llama_model_n_devices(const struct llama_model * model) {
      return (int32_t)model->devices.size();
  }
-@@ -4020,7 +4730,8 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
+@@ -4020,7 +4827,8 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
      TENSOR_SKIP           (llama_model_loader::TENSOR_SKIP),
      TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL),
      TENSOR_ALLOW_RESHAPE  (llama_model_loader::TENSOR_ALLOW_RESHAPE),
@@ -105175,7 +105273,7 @@ index 7c75ab55e..4f5fe619c 100644
  
  ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
      GGML_ASSERT(ml != nullptr);
-@@ -4147,6 +4858,14 @@ static void llama_tensor_rows_to_f32(const ggml_tensor * tensor, int64_t row0, i
+@@ -4147,6 +4955,14 @@ static void llama_tensor_rows_to_f32(const ggml_tensor * tensor, int64_t row0, i
      }
  }
  
@@ -105190,7 +105288,7 @@ index 7c75ab55e..4f5fe619c 100644
  uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out) {
      if (model->vocab.n_tokens() == 0 || model->tok_embd == nullptr) {
          return 0;
-@@ -4188,3 +4907,103 @@ uint32_t llama_model_get_tok_embd_rows(const struct llama_model * model, const l
+@@ -4188,3 +5004,103 @@ uint32_t llama_model_get_tok_embd_rows(const struct llama_model * model, const l
  
      return n_tokens * (uint32_t) tensor->ne[0];
  }
@@ -105295,7 +105393,7 @@ index 7c75ab55e..4f5fe619c 100644
 +
 +
 diff --git a/src/llama-model.h b/src/llama-model.h
-index 1b7ea1ce7..dc6b8b4b9 100644
+index 1b7ea1ce7..14528b145 100644
 --- a/src/llama-model.h
 +++ b/src/llama-model.h
 @@ -691,8 +691,12 @@ struct llama_device {
@@ -105313,7 +105411,7 @@ index 1b7ea1ce7..dc6b8b4b9 100644
  };
  
  struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
-@@ -765,6 +769,21 @@ struct llama_rope_params {
+@@ -765,6 +769,27 @@ struct llama_rope_params {
      ggml_tensor * k_norm  = nullptr; // K norm weight applied after RoPE, a K-shift has to undo it
  };
  
@@ -105328,6 +105426,12 @@ index 1b7ea1ce7..dc6b8b4b9 100644
 +    ggml_tensor * head = nullptr; // [n_embd, n_rows], same type as the LM head
 +    ggml_tensor * ids  = nullptr; // [n_rows] I64, token id of each row
 +
++    // coarse mode (env LLAMA_MTP_DRAFT_COARSE=K): `head` is the WHOLE LM head requantized to a low-bit type
++    // (LLAMA_MTP_DRAFT_COARSE_TYPE, default q2_K), `ids` is unused. The graph scores every token with it, takes
++    // the K best and rescores those K rows exactly against the original head (the rest keep their coarse
++    // logits). Only the draft proposal changes; the target verifies with its own untouched head.
++    int32_t rerank = 0;
++
 +    ggml_context_ptr        ctx;
 +    ggml_backend_buffer_ptr buf;
 +};
@@ -105335,7 +105439,7 @@ index 1b7ea1ce7..dc6b8b4b9 100644
  struct llama_model {
      llm_type type = LLM_TYPE_UNKNOWN;
      llm_arch arch = LLM_ARCH_UNKNOWN;
-@@ -925,6 +944,9 @@ struct llama_model {
+@@ -925,6 +950,9 @@ struct llama_model {
      // unified vector to store target-model extracted layer ids in eagle3, dflash, etc.
      std::vector<int32_t> target_layer_ids;
  
@@ -105345,7 +105449,7 @@ index 1b7ea1ce7..dc6b8b4b9 100644
      std::vector<llama_layer> layers;
  
      //Dense linear projections for SentenceTransformers models like embeddinggemma
-@@ -943,6 +965,9 @@ struct llama_model {
+@@ -943,6 +971,9 @@ struct llama_model {
      // for quantize-stats only
      std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
  
@@ -105355,7 +105459,7 @@ index 1b7ea1ce7..dc6b8b4b9 100644
      // for keeping track of associated LoRA adapters
      std::unordered_set<llama_adapter_lora *> loras;
  
-@@ -976,9 +1001,34 @@ struct llama_model {
+@@ -976,9 +1007,34 @@ struct llama_model {
  
      std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
  
@@ -105390,7 +105494,7 @@ index 1b7ea1ce7..dc6b8b4b9 100644
      void print_info() const;
  
      ggml_backend_dev_t dev_layer(int il) const;
-@@ -995,6 +1045,11 @@ struct llama_model {
+@@ -995,6 +1051,13 @@ struct llama_model {
  
      // same, for the keys of the lightning indexer
      virtual llama_rope_params get_rope_params_indexer(const llama_cparams & cparams, int il) const;
@@ -105399,10 +105503,12 @@ index 1b7ea1ce7..dc6b8b4b9 100644
 +    // shared_target_head = true: this model is the target of a shared-NextN sidecar whose MTP graph borrows this
 +    // output as its LM head - the consumer is that sidecar's graph, so the model's own MTP-block checks are skipped
 +    std::shared_ptr<const llama_mtp_draft_vocab> mtp_draft_vocab_get(int32_t n_keep, bool shared_target_head = false) const;
++    // coarse low-bit copy of the whole LM head for drafters (env LLAMA_MTP_DRAFT_COARSE=K), nullptr when off
++    std::shared_ptr<const llama_mtp_draft_vocab> draft_coarse_head() const;
  
      float get_rope_freq_base (const llama_cparams & cparams, int il) const;
      float get_rope_freq_scale(const llama_cparams & cparams, int il) const;
-@@ -1040,6 +1095,7 @@ struct llama_model_base : public llama_model {
+@@ -1040,6 +1103,7 @@ struct llama_model_base : public llama_model {
      const int TENSOR_SKIP_IF_VIRTUAL;
      const int TENSOR_ALLOW_RESHAPE;
      const int TENSOR_READ_LAZY;
@@ -106133,16 +106239,30 @@ index cfef363b6..69c72eee3 100644
  
  struct llama_model_qwen35moe : public llama_model_base {
 diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
-index 5b05fc63f..067f12631 100644
+index 5b05fc63f..087637e06 100644
 --- a/src/models/qwen35.cpp
 +++ b/src/models/qwen35.cpp
-@@ -662,7 +662,18 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llm_graph_params & params)
+@@ -662,7 +662,32 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llm_graph_params & params)
      ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
      ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
      GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
 -    cur = build_lora_mm(head_w, cur, head_s);
 +    if (mtp_draft != nullptr && head_w == model.output && n_outputs == 1) {
 +        // this context drafts over a row subset of the LM head: scatter its logits into a full-vocab row of -inf
++        if (mtp_draft->rerank > 0 && head_s == nullptr) {
++            // coarse head over the whole vocabulary, then the best `rerank` tokens rescored exactly
++            ggml_tensor * coarse = build_lora_mm(mtp_draft->head, cur, nullptr);          // [n_vocab, 1]
++            cb(coarse, "mtp_coarse_logits", -1);
++            ggml_tensor * best  = ggml_top_k(ctx0, coarse, mtp_draft->rerank);            // [K, 1] I32
++            ggml_tensor * rows  = ggml_get_rows(ctx0, model.output, best);                // [n_embd, K] F32
++            ggml_tensor * exact = ggml_mul_mat(ctx0, rows, cur);                          // [K, 1]
++            const int64_t n_row = coarse->ne[0];
++            cur = ggml_set_rows(ctx0, ggml_reshape_2d(ctx0, coarse, 1, n_row), ggml_reshape_2d(ctx0, exact, 1, mtp_draft->rerank), best);
++            cur = ggml_reshape_2d(ctx0, cur, n_row, 1);
++            cb(cur, "result_output", -1);
++            res->t_logits = cur;
++            return;
++        }
 +        GGML_ASSERT(mtp_draft->n_keep == cparams.mtp_draft_vocab);
 +        const int64_t n_sel = mtp_draft->head->ne[1];
 +        const int64_t n_row = model.output->ne[1];
@@ -106157,16 +106277,30 @@ index 5b05fc63f..067f12631 100644
  
      res->t_logits = cur;
 diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
-index c0ee6fa03..595f0c1bd 100644
+index c0ee6fa03..e9ee33c13 100644
 --- a/src/models/qwen35moe.cpp
 +++ b/src/models/qwen35moe.cpp
-@@ -698,7 +698,18 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llm_graph_params & params)
+@@ -698,7 +698,32 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llm_graph_params & params)
      ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
      ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
      GGML_ASSERT(head_w && "QWEN35MOE MTP: missing LM head (nextn.shared_head_head or model.output)");
 -    cur = build_lora_mm(head_w, cur, head_s);
 +    if (mtp_draft != nullptr && head_w == model.output && n_outputs == 1) {
 +        // this context drafts over a row subset of the LM head: scatter its logits into a full-vocab row of -inf
++        if (mtp_draft->rerank > 0 && head_s == nullptr) {
++            // coarse head over the whole vocabulary, then the best `rerank` tokens rescored exactly
++            ggml_tensor * coarse = build_lora_mm(mtp_draft->head, cur, nullptr);          // [n_vocab, 1]
++            cb(coarse, "mtp_coarse_logits", -1);
++            ggml_tensor * best  = ggml_top_k(ctx0, coarse, mtp_draft->rerank);            // [K, 1] I32
++            ggml_tensor * rows  = ggml_get_rows(ctx0, model.output, best);                // [n_embd, K] F32
++            ggml_tensor * exact = ggml_mul_mat(ctx0, rows, cur);                          // [K, 1]
++            const int64_t n_row = coarse->ne[0];
++            cur = ggml_set_rows(ctx0, ggml_reshape_2d(ctx0, coarse, 1, n_row), ggml_reshape_2d(ctx0, exact, 1, mtp_draft->rerank), best);
++            cur = ggml_reshape_2d(ctx0, cur, n_row, 1);
++            cb(cur, "result_output", -1);
++            res->t_logits = cur;
++            return;
++        }
 +        GGML_ASSERT(mtp_draft->n_keep == cparams.mtp_draft_vocab);
 +        const int64_t n_sel = mtp_draft->head->ne[1];
 +        const int64_t n_row = model.output->ne[1];

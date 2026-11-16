@@ -1,6 +1,6 @@
 # burnoutIA/llama-cpp-rdna-boosts — the `harn` branch
 
-A fork of [stew675/llama-cpp-rdna-boosts](https://github.com/stew675/llama-cpp-rdna-boosts) carrying two extra
+A fork of [stew675/llama-cpp-rdna-boosts](https://github.com/stew675/llama-cpp-rdna-boosts) carrying three extra
 blocks on top of the upstream release `v16-4f9dfa0e3-r289`. It is the engine that
 [Harn](https://github.com/burnoutIA) builds for RDNA4 cards. Everything else (base, blocks `0000`–`0015`, `0300`,
 the scripts and the docs) is upstream, unchanged.
@@ -9,9 +9,10 @@ the scripts and the docs) is upstream, unchanged.
 |---|---|---|
 | `0090` | speculative verify (2–16 columns) in WMMA iu8 | RDNA4 only (gfx1200/gfx1201) |
 | `0091` | GDN conv + q/k norm fusion no longer refused on a deferred conv-state gather | every GPU the HIP/CUDA path serves |
+| `0092` | MTP draft head: coarse low-bit copy over the full vocabulary, exact rerank (opt-in) | Qwen3.5/3.6/3.8 MTP, any backend |
 
-`release.json` records the new default tree (`v18-4f9dfa0e3-r289-harn1`, tree `01460a79b0f4…`); `scripts/apply-all.sh`
-applies the 19 default patches strictly, as upstream.
+`release.json` records the new default tree (`v19-4f9dfa0e3-r289-harn2`, tree `345e62faed51…`); `scripts/apply-all.sh`
+applies the 20 default patches strictly, as upstream.
 
 ## 0090 — speculative verify in WMMA iu8 (RDNA4)
 
@@ -45,6 +46,28 @@ conv-state tensor. On the speculative verify path the conv-state gather is defer
 the cache row and never that dead GET_ROWS output, so the overlap is harmless. The q/k norms then ran as a
 separate kernel plus one launch in every Gated DeltaNet layer (−0.7 ms per DFlash2 cycle on the 27B once fixed).
 Results are bit-identical; `GGML_CUDA_FUSE_GDN_CONV_NORM=0` still disables the fusion.
+
+## 0092 — coarse MTP draft head with exact rerank (opt-in)
+
+Every MTP draft step reads the LM head (248k × 5120, Q6_K: 1.04 GB on Qwen3.8-27B). `--spec-draft-mtp-vocab N`
+(block `0013`) cuts that read by scoring only the first N token ids, which costs acceptance on prose. With
+`LLAMA_MTP_DRAFT_COARSE=K` set as well, the drafter keeps the full vocabulary: it scores every token with a
+low-bit copy of the head (`LLAMA_MTP_DRAFT_COARSE_TYPE`, default `q2_K`; `q2_0` measured best), requantized once
+on the CPU at load (+4.5 s on the 27B), then rescores the best K exactly against the original head. Only the draft
+proposal changes; the target verifies with its own head. The idea comes from vllm-radiance's 2-bit draft head.
+
+R9700, Qwen3.8-27B Uncensored Q4_K_M, 10 seeds, 256 tokens, temperature 1 (code / prose tok/s, prose acceptance):
+
+| draft head | code | prose | prose acceptance |
+|---|---|---|---|
+| MTP3, vocab 98304 | 88.8 | 48.2 | 0.314 |
+| MTP3, full vocab | 82.7 | 50.0 | 0.386 |
+| MTP3, coarse `q2_0`, K=64 | 88.7 | 53.4 | 0.382 |
+| adaptive ≤9 + ngram, vocab 98304 | 115.4 | 43.0 | 0.199 |
+| adaptive ≤9 + ngram, coarse `q2_0` | 115.1 | 47.4 | 0.232 |
+
+K = 16, 64 and 256 measure the same. The same scheme on the DFlash2 drafter was rejected: its selector reads the
+whole distribution, acceptance fell (0.694 → 0.655) for 0.4 ms per cycle.
 
 ## Not re-validated
 
